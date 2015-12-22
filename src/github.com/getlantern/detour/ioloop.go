@@ -38,6 +38,8 @@ func (dc *Conn) ioLoop() {
 	// TODO: How to check when using pipelining or HTTP/2?
 	var nonidempotentHTTPRequest bool
 
+	var readCount int
+
 	for {
 		select {
 		case c := <-dc.chConnToIOLoop:
@@ -84,10 +86,23 @@ func (dc *Conn) ioLoop() {
 
 		case req := <-dc.chReadRequest:
 			chMergeReads := make(chan innerReadResult)
-			first := !dc.anyDataReceived()
-			if first {
-				firstReadReq = &innerReadRequest{req.buf, chMergeReads}
+			readCount++
+			first := readCount == 1
+			if !first {
+				if conns.Len() != 1 {
+					log.Errorf("******conns.Len() == %d to %s", conns.Len(), dc.addr)
+					//panic("should have one and only one connection")
+				}
+				c := conns.Next()
+				go func() {
+					n, err := c.Read(req.buf, false)
+					log.Tracef("Read %d bytes via %s connection to %s (follow-up), err: %v", n, c.Type(), dc.addr, err)
+					req.chResult <- ioResult{n, err}
+				}()
+				continue
 			}
+			firstReadReq = &innerReadRequest{req.buf, chMergeReads}
+
 			// read from all current connections, typically only one
 			conns.Foreach(func(c conn) bool {
 				r := &reader{
@@ -95,7 +110,6 @@ func (dc *Conn) ioLoop() {
 					chMerge:      chMergeReads,
 					chDialDetour: dc.chDialDetourNow,
 					buf:          make([]byte, len(req.buf)),
-					first:        first,
 					addr:         dc.addr,
 					chClose:      dc.chClose,
 				}
@@ -235,14 +249,13 @@ type reader struct {
 	chMerge      chan innerReadResult
 	chDialDetour chan struct{}
 	buf          []byte
-	first        bool
 	addr         string
 	chClose      chan struct{}
 }
 
 func (r *reader) run() {
-	n, err := r.c.Read(r.buf, r.first)
-	log.Tracef("Read %d bytes via %s connection to %s, first: %v, err: %v", n, r.c.Type(), r.addr, r.first, err)
+	n, err := r.c.Read(r.buf, false)
+	log.Tracef("Read %d bytes via %s connection to %s (first), err: %v", n, r.c.Type(), r.addr, err)
 	if err != nil {
 		switch r.c.Type() {
 		case connTypeDirect:
